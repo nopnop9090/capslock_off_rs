@@ -1,7 +1,7 @@
 <a href="https://notbyhumans.fyi">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://notbyhumans.fyi/badges/developed-paper.svg">
-    <img src="https://notbyhumans.fyi/badges/developed-ink.svg" width="165" height="54" alt="Developed by AI, not by humans">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/notbyhumans-developed-paper.svg">
+    <img src="assets/notbyhumans-developed-ink.svg" width="165" height="54" alt="Developed by AI, not by humans">
   </picture>
 </a>
 

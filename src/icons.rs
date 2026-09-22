@@ -1,87 +1,54 @@
 //! Tray-Icon Loader.
 //!
-//! Laedt PNG-Dateien aus `assets/` zur Runtime und konvertiert sie in
-//! RGBA-Buffer (das Format, das `tray_icon::Icon` erwartet).
+//! PNG-Icons werden zur Compile-Time via `include_bytes!` in die EXE
+//! eingebettet. Es gibt keine Runtime-File-Reads aus `assets/`. Die
+//! `assets/`-Dateien existieren nur noch fuer die README-Badges.
 //!
 //! 3 Icons:
 //!   - `icon_normal.png`  gelber Akzent
 //!   - `icon_block.png`   gruener Akzent + roter Slash
 //!   - `icon-shift.png`   blauer Akzent + Aufwaerts-Pfeil
-//!
-//! Kein Caching auf Modulebene -- `tray_icon::Icon` ist nicht Sync (intern
-//! `*mut c_void`). Jeder Aufrufer haelt sein eigenes Icon in seinem Struct.
-use std::path::PathBuf;
-
 use crate::state::Mode;
 
-/// Liefert den Pfad zum assets/-Verzeichnis.
-/// Suche relativ zur Exe, sonst relativ zum aktuellen Working-Dir.
-fn assets_dir() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidates = [
-                parent.join("assets"),
-                parent.parent().map(|p| p.join("assets")).unwrap_or_default(),
-                parent
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.join("assets"))
-                    .unwrap_or_default(),
-            ];
-            for c in &candidates {
-                if c.exists() {
-                    return Some(c.clone());
-                }
-            }
-        }
-    }
-    let cwd = std::env::current_dir().ok()?.join("assets");
-    if cwd.exists() {
-        return Some(cwd);
-    }
-    None
-}
+// Compile-time in die Binary eingebettet. Pfade relativ zu src/.
+const ICON_NORMAL_PNG: &[u8] = include_bytes!("../assets/icon_normal.png");
+const ICON_BLOCK_PNG: &[u8] = include_bytes!("../assets/icon_block.png");
+const ICON_SHIFT_PNG: &[u8] = include_bytes!("../assets/icon_shift.png");
 
-fn load_icon(name: &str) -> Option<tray_icon::Icon> {
-    let dir = assets_dir()?;
-    let path = dir.join(name);
-    let bytes = std::fs::read(&path)
-        .map_err(|e| log::warn!("Icon {path:?} lesen fehlgeschlagen: {e}"))
-        .ok()?;
-    let img = image::load_from_memory(&bytes)
-        .map_err(|e| log::warn!("Icon {path:?} dekodieren fehlgeschlagen: {e}"))
+fn load_icon(bytes: &[u8]) -> Option<tray_icon::Icon> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| log::warn!("Icon-Dekodierung fehlgeschlagen: {e}"))
         .ok()?;
     let rgba = img.into_rgba8();
     let (w, h) = rgba.dimensions();
     tray_icon::Icon::from_rgba(rgba.into_raw(), w, h)
-        .map_err(|e| log::warn!("Icon {name} in tray-icon::Icon konvertieren: {e}"))
+        .map_err(|e| log::warn!("tray_icon::Icon-Konvertierung: {e}"))
         .ok()
 }
 
-fn load_for_mode(mode: Mode) -> Option<tray_icon::Icon> {
-    let name = match mode {
-        Mode::Normal => "icon_normal.png",
-        Mode::Block => "icon_block.png",
-        Mode::Shift => "icon_shift.png",
-    };
-    load_icon(name)
+fn fallback() -> tray_icon::Icon {
+    // 16x16 dunkelgrau. Sollte nie greifen wenn die PNGs korrekt
+    // eingebettet sind.
+    tray_icon::Icon::from_rgba(vec![80u8; 16 * 16 * 4], 16, 16).unwrap()
 }
 
-/// Liefert das passende Icon fuer den Mode.
-/// Fallback: einfarbiges Rechteck (sollte nie greifen wenn assets/ stimmt).
+/// Liefert das passende Icon fuer den Mode (zur Compile-Time eingebettet).
 pub fn for_mode(mode: Mode) -> tray_icon::Icon {
-    if let Some(icon) = load_for_mode(mode) {
-        return icon;
-    }
-    // Fallback: 1x1 graues Icon.
-    tray_icon::Icon::from_rgba(vec![128, 128, 128, 255], 1, 1).unwrap()
+    let bytes = match mode {
+        Mode::Normal => ICON_NORMAL_PNG,
+        Mode::Block => ICON_BLOCK_PNG,
+        Mode::Shift => ICON_SHIFT_PNG,
+    };
+    load_icon(bytes).unwrap_or_else(fallback)
 }
 
 /// Initialisiert (laedt einmal). Sollte beim Start aufgerufen werden,
-/// damit Asset-Fehler frueh sichtbar werden.
+/// damit Asset-Fehler frueh sichtbar werden (loggt nur, faellt sonst
+/// auf fallback zurueck).
 pub fn preload() {
-    for mode in [Mode::Normal, Mode::Block, Mode::Shift] {
-        let _ = for_mode(mode);
+    for bytes in [ICON_NORMAL_PNG, ICON_BLOCK_PNG, ICON_SHIFT_PNG] {
+        if load_icon(bytes).is_none() {
+            log::warn!("preload: Icon fehlgeschlagen ({} bytes)", bytes.len());
+        }
     }
-    log::info!("assets_dir = {:?}", assets_dir());
 }

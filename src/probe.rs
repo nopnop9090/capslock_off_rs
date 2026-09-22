@@ -9,6 +9,8 @@
 //! shift_injected_count zaehlt nur shift-Modus-Injektionen.
 //!
 //! Exit 0 wenn alle Phasen ok, sonst Exit 1.
+use std::fs;
+use std::io::Write;
 use std::thread;
 use std::time::Duration;
 
@@ -23,6 +25,22 @@ struct PhaseStats {
 }
 
 pub fn run() -> i32 {
+    run_internal(&None)
+}
+
+/// Probe mit doppelter Ausgabe: Logs in Datei UND (falls Console vorhanden)
+/// in stdout. Return: 0 = ok, 1 = fehler.
+pub fn run_with_log(log_path: &Option<std::path::PathBuf>) -> i32 {
+    if let Some(p) = log_path.as_deref() {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    let path = log_path.clone();
+    run_internal(&path)
+}
+
+fn run_internal(log_path: &Option<std::path::PathBuf>) -> i32 {
     log::info!("Probe-Modus: Hook + Auto-Inject (alle 3 Modi).");
     let mut h = KeyboardHook::new();
     if let Err(e) = h.start() {
@@ -47,7 +65,7 @@ pub fn run() -> i32 {
 
     let ok = ok_block && ok_shift && ok_normal;
 
-    println!(
+    let line = format!(
         "probe_ergebnis: block=ok({}) shift=ok({}) normal=ok({}) \
          block[seen={},blocked={},inj={}] shift[seen={},blocked={},inj={}] \
          normal[seen={},blocked={},inj={}] OK={}",
@@ -65,6 +83,16 @@ pub fn run() -> i32 {
         normal_s.shift_inj,
         ok,
     );
+    println!("{line}");
+    if let Some(p) = log_path.as_deref() {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
 
     if ok {
         0
