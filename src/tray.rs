@@ -1,23 +1,25 @@
-//! System-Tray-Icon + Menue via `tray-icon` Crate.
+//! System-Tray-Icon + Menue via `tray-icon` Crate (muda-Backend).
 //!
-//! Menuepunkte (statische IDs):
-//!   - Header: Status (read-only)
-//!   - "Normal"        (radio, id=mode_normal)
-//!   - "Blockiert"     (radio, id=mode_block)
-//!   - "Shift Left"    (radio, id=mode_shift)
-//!   - Separator
-//!   - "Mit Windows starten" (checkbox, id=autostart)
-//!   - Separator
-//!   - "Test: Caps-Event senden" (id=test_inject)
-//!   - Separator
-//!   - "Beenden" (id=quit)
+//! Menuepunkte:
+//!   - Header: "Caps = <mode>" (read-only)
+//!   - 3 CheckMenuItems fuer die Modi (id=mode_normal/block/shift) -
+//!     zeigen nativen Windows-Haken (`MF_CHECKED`).
+//!   - CheckMenuItem fuer Autostart (id=autostart)
+//!   - MenuItems fuer Test/About/Quit (statisch)
+//!
+//! muda nutzt Windows-native Checkbox-Style fuer alle CheckMenuItems.
+//! Visuell zeigen die 3 Mode-Items einen Haken am aktiven Mode -- das ist
+//! Standard-UX fuer mutually-exclusive Menue-Selection (siehe Windows
+//! Explorer "View > Sort by"). Bei Bedarf kann man spaeter auf
+//! MF_RADIOCHECK umsteigen, aber das braucht Zugriff auf muda's
+//! platform_impl, was `pub(crate)` ist.
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -56,36 +58,23 @@ impl From<MenuEvent> for TrayCommand {
 
 pub type CmdHandler = Arc<dyn Fn(TrayCommand) + Send + Sync>;
 
-/// Externes Quit-Signal (vom App-Handle genutzt).
 static QUIT_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 pub fn signal_quit_external() {
     QUIT_SIGNAL.store(true, Ordering::SeqCst);
 }
 
-/// Bauen und Ausfuehren des Tray. Blockiert bis Quit signalisiert wird.
-///
-/// **Wichtig:** tray-icon 0.19 registriert ein hidden Window mit
-/// `WndProc = tray_proc`, startet aber **keine eigene Message-Loop**.
-/// Ohne aktive `GetMessageW/DispatchMessageW`-Loop im Mainthread kommen
-/// die `WM_USER_TRAYICON`-Klicks vom Explorer-Shell nicht im WindowProc
-/// an und das Menü-Popup geht nicht auf.
 pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
     QUIT_SIGNAL.store(false, Ordering::SeqCst);
     let app_for_cmd = Arc::clone(&app);
     let cmd_handler: CmdHandler = Arc::new(move |cmd| {
         app::handle_tray_command(Arc::clone(&app_for_cmd), cmd);
     });
-    let mut state = TrayState {
-        cmd: cmd_handler.clone(),
-        icon: None,
-        current_mode: mode,
-    };
+    let mut state = TrayState::new();
     state
         .build(mode)
         .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))?;
 
-    // File-Logger fuer Diagnose.
     let log_path = tray_log_path();
     let mut log_file: Option<File> = match log_path.as_ref() {
         Some(p) => OpenOptions::new()
@@ -103,9 +92,6 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
         let _ = writeln!(f, "[ts={ts}] tray.run() gestartet, mode={mode:?}");
     }
 
-    // Menu-Event-Channel: muda dispatchet Menu-Klicks via set_event_handler
-    // (direkter Callback), wir forwarden an einen mpsc::Sender und lesen
-    // in der Main-Message-Loop (non-blocking try_recv zwischen Messages).
     let (menu_tx, menu_rx) = mpsc::channel::<TrayCommand>();
     {
         let log_path_clone = log_path.clone();
@@ -129,23 +115,32 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
     loop {
         iteration += 1;
 
-        // Drain pending menu events (non-blocking).
         while let Ok(cmd) = menu_rx.try_recv() {
             log::info!("TrayCommand: {:?}", cmd);
             if let Some(f) = log_file.as_mut() {
                 let _ = writeln!(f, "[iter {iteration}] CMD {cmd:?}");
             }
             cmd_handler(cmd);
-            // Nach ToggleAutostart das Menu neu bauen, damit der Haken
-            // ([x] vs [ ]) sofort den neuen Status reflektiert.
-            if matches!(cmd, TrayCommand::ToggleAutostart) {
-                if let Err(e) = state.rebuild_menu() {
-                    log::warn!("rebuild_menu fehlgeschlagen: {e:?}");
+
+            // Mode-Wechsel: Haken auf den richtigen Mode setzen,
+            // Header-Text + Tooltip + Icon aktualisieren.
+            if let TrayCommand::SetMode(new_mode) = cmd {
+                state.current_mode = new_mode;
+                state.refresh_mode_checks();
+                if let Some(i) = state.header_item.as_ref() {
+                    i.set_text(format!("Caps = {}", new_mode.as_str()));
                 }
+                if let Some(icon) = state.icon.as_ref() {
+                    let _ = icon.set_tooltip(Some(format!("CapsLock: {}", new_mode.as_str())));
+                    let _ = icon.set_icon(Some(icons::for_mode(new_mode)));
+                }
+            }
+            // Autostart-Toggle: Haken aus Registry frisch lesen.
+            if matches!(cmd, TrayCommand::ToggleAutostart) {
+                state.refresh_autostart_check();
             }
         }
 
-        // Quit-Signal?
         if QUIT_SIGNAL.load(Ordering::SeqCst) {
             if let Some(f) = log_file.as_mut() {
                 let _ = writeln!(f, "[iter {iteration}] QUIT signal");
@@ -153,8 +148,6 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
             unsafe { PostQuitMessage(0) };
         }
 
-        // Auf naechste Message warten (blockierend). Dispatches das
-        // tray-icon-Window automatisch via tray_proc.
         let ret = unsafe {
             GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0)
         };
@@ -164,32 +157,94 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
             }
             break;
         }
-
-        // WM_USER_TRAYICON vom Explorer ruft tray_proc auf, der das
-        // Menue via TrackPopupMenu zeigt. Menu-Klicks erzeugen dann
-        // MenuEvents, die oben gedraint werden.
         unsafe {
             let _ = TranslateMessage(&msg);
             let _ = DispatchMessageW(&msg);
         }
     }
 
-    // Cleanup: Handler abmelden + Tray-Icon drop -> Shell_NotifyIcon NIM_DELETE.
     MenuEvent::set_event_handler::<Box<dyn Fn(MenuEvent) + Send + Sync>>(None);
     state.icon = None;
     Ok(())
 }
 
+/// Hauptobjekt im Mainthread: haelt das TrayIcon + alle Menu-Items,
+/// damit wir `set_checked` auf den Items aufrufen koennen (fuer Mode-
+/// Wechsel und Autostart-Toggle).
 struct TrayState {
-    cmd: CmdHandler,
     icon: Option<TrayIcon>,
     current_mode: Mode,
+    header_item: Option<MenuItem>,
+    normal_item: Option<CheckMenuItem>,
+    block_item: Option<CheckMenuItem>,
+    shift_item: Option<CheckMenuItem>,
+    autostart_item: Option<CheckMenuItem>,
 }
 
 impl TrayState {
+    fn new() -> Self {
+        Self {
+            icon: None,
+            current_mode: Mode::Block, // wird in build() ueberschrieben
+            header_item: None,
+            normal_item: None,
+            block_item: None,
+            shift_item: None,
+            autostart_item: None,
+        }
+    }
+
     fn build(&mut self, mode: Mode) -> tray_icon::Result<()> {
         self.current_mode = mode;
-        let menu = build_menu(mode);
+
+        let header = MenuItem::new(format!("Caps = {}", mode.as_str()), false, None);
+        let normal = CheckMenuItem::with_id(
+            "mode_normal",
+            "Normal (Caps ist normal)",
+            true,
+            mode == Mode::Normal,
+            None,
+        );
+        let block = CheckMenuItem::with_id(
+            "mode_block",
+            "Blockiert (Caps tot)",
+            true,
+            mode == Mode::Block,
+            None,
+        );
+        let shift = CheckMenuItem::with_id(
+            "mode_shift",
+            "Shift Left (Caps = Shift)",
+            true,
+            mode == Mode::Shift,
+            None,
+        );
+        let autostart = CheckMenuItem::with_id(
+            "autostart",
+            "Mit Windows starten",
+            true,
+            autostart::is_enabled(),
+            None,
+        );
+        let test = MenuItem::with_id("test_inject", "Test: Caps-Event senden", true, None);
+        let about = MenuItem::with_id("about", "About...", true, None);
+        let quit = MenuItem::with_id("quit", "Beenden", true, None);
+
+        let menu = Menu::new();
+        let _ = menu.append(&header);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&normal);
+        let _ = menu.append(&block);
+        let _ = menu.append(&shift);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&autostart);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&test);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&about);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&quit);
+
         let icon = TrayIconBuilder::new()
             .with_id("capslock_off")
             .with_tooltip(format!("CapsLock: {}", mode.as_str()))
@@ -197,63 +252,34 @@ impl TrayState {
             .with_menu(Box::new(menu))
             .build()?;
         self.icon = Some(icon);
+
+        self.header_item = Some(header);
+        self.normal_item = Some(normal);
+        self.block_item = Some(block);
+        self.shift_item = Some(shift);
+        self.autostart_item = Some(autostart);
+
         Ok(())
     }
 
-    /// Baut das Menu neu (liest `autostart::is_enabled()` frisch aus der
-    /// Registry) und setzt es am Tray-Icon. Wird nach `ToggleAutostart`
-    /// aufgerufen, damit der [x]/[ ]-Haken den neuen Status zeigt.
-    fn rebuild_menu(&mut self) -> tray_icon::Result<()> {
-        let menu = build_menu(self.current_mode);
-        if let Some(icon) = self.icon.as_ref() {
-            icon.set_menu(Some(Box::new(menu)));
+    fn refresh_mode_checks(&self) {
+        let m = self.current_mode;
+        if let Some(i) = self.normal_item.as_ref() {
+            i.set_checked(m == Mode::Normal);
         }
-        Ok(())
+        if let Some(i) = self.block_item.as_ref() {
+            i.set_checked(m == Mode::Block);
+        }
+        if let Some(i) = self.shift_item.as_ref() {
+            i.set_checked(m == Mode::Shift);
+        }
     }
-}
 
-fn build_menu(mode: Mode) -> Menu {
-    let menu = Menu::new();
-    let header = MenuItem::new(
-        format!("Status: Caps = {}", mode.as_str()),
-        false,
-        None,
-    );
-    let _ = menu.append(&header);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    let normal = MenuItem::with_id("mode_normal", "Normal (Caps ist normal)", true, None);
-    let block = MenuItem::with_id("mode_block", "Blockiert (Caps tot)", true, None);
-    let shift = MenuItem::with_id("mode_shift", "Shift Left (Caps = Shift)", true, None);
-    let _ = menu.append(&normal);
-    let _ = menu.append(&block);
-    let _ = menu.append(&shift);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    let auto_item = MenuItem::with_id(
-        "autostart",
-        if autostart::is_enabled() {
-            "[x] Mit Windows starten"
-        } else {
-            "[ ] Mit Windows starten"
-        },
-        true,
-        None,
-    );
-    let _ = menu.append(&auto_item);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    let test = MenuItem::with_id("test_inject", "Test: Caps-Event senden", true, None);
-    let _ = menu.append(&test);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    let about = MenuItem::with_id("about", "About...", true, None);
-    let _ = menu.append(&about);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-
-    let quit = MenuItem::with_id("quit", "Beenden", true, None);
-    let _ = menu.append(&quit);
-    menu
+    fn refresh_autostart_check(&self) {
+        if let Some(i) = self.autostart_item.as_ref() {
+            i.set_checked(autostart::is_enabled());
+        }
+    }
 }
 
 fn tray_log_path() -> Option<std::path::PathBuf> {
