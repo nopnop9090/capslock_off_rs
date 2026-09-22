@@ -123,13 +123,10 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
             cmd_handler(cmd);
 
             // Mode-Wechsel: Haken auf den richtigen Mode setzen,
-            // Header-Text + Tooltip + Icon aktualisieren.
+            // Tooltip + Icon aktualisieren.
             if let TrayCommand::SetMode(new_mode) = cmd {
                 state.current_mode = new_mode;
                 state.refresh_mode_checks();
-                if let Some(i) = state.header_item.as_ref() {
-                    i.set_text(format!("Caps = {}", new_mode.as_str()));
-                }
                 if let Some(icon) = state.icon.as_ref() {
                     let _ = icon.set_tooltip(Some(format!("CapsLock: {}", new_mode.as_str())));
                     let _ = icon.set_icon(Some(icons::for_mode(new_mode)));
@@ -174,7 +171,6 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
 struct TrayState {
     icon: Option<TrayIcon>,
     current_mode: Mode,
-    header_item: Option<MenuItem>,
     normal_item: Option<CheckMenuItem>,
     block_item: Option<CheckMenuItem>,
     shift_item: Option<CheckMenuItem>,
@@ -186,7 +182,6 @@ impl TrayState {
         Self {
             icon: None,
             current_mode: Mode::Block, // wird in build() ueberschrieben
-            header_item: None,
             normal_item: None,
             block_item: None,
             shift_item: None,
@@ -197,7 +192,6 @@ impl TrayState {
     fn build(&mut self, mode: Mode) -> tray_icon::Result<()> {
         self.current_mode = mode;
 
-        let header = MenuItem::new(format!("Caps = {}", mode.as_str()), false, None);
         let normal = CheckMenuItem::with_id(
             "mode_normal",
             "Normal (Caps ist normal)",
@@ -231,8 +225,6 @@ impl TrayState {
         let quit = MenuItem::with_id("quit", "Beenden", true, None);
 
         let menu = Menu::new();
-        let _ = menu.append(&header);
-        let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&normal);
         let _ = menu.append(&block);
         let _ = menu.append(&shift);
@@ -253,7 +245,6 @@ impl TrayState {
             .build()?;
         self.icon = Some(icon);
 
-        self.header_item = Some(header);
         self.normal_item = Some(normal);
         self.block_item = Some(block);
         self.shift_item = Some(shift);
