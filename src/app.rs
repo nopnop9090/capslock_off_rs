@@ -117,6 +117,7 @@ pub fn handle_tray_command(app: Arc<Mutex<App>>, cmd: crate::tray::TrayCommand) 
             Ok(active) => log::info!("autostart toggled -> {active}"),
             Err(e) => log::error!("autostart toggle failed: {e}"),
         },
+        TrayCommand::About => show_about_dialog(),
         TrayCommand::TestInject => {
             let stats_before = {
                 let me = app.lock().unwrap();
@@ -164,5 +165,45 @@ fn mode_from_u8(v: u8) -> Mode {
         2 => Mode::Shift,
         1 => Mode::Block,
         _ => Mode::Normal,
+    }
+}
+
+/// Zeigt ein modales About-MessageBox mit Version + kurzer Beschreibung
+/// + notbyhumans-Verweis. Erscheint asynchron zum Tray-Loop, wird aber
+/// blockierend fuer den Mainthread bis der User auf OK klickt -- das ist
+/// akzeptabel fuer ein Tray-About.
+fn show_about_dialog() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK,
+    };
+    let title = format!("About capslock_off v{}", crate::version::VERSION);
+    let text = format!(
+        "capslock_off v{}\n\
+         \n\
+         CapsLock-Taste systemweit (User-Session) deaktivieren \
+         oder als LeftShift umbelegen.\n\
+         \n\
+         Modi: Normal / Block / Shift Left\n\
+         Tray: Rechtsklick fuer Menue\n\
+         Autostart: HKCU Run-Key (kein Admin)\n\
+         IPC: WM_COPYDATA + Shared-Memory\n\
+         \n\
+         Native single-file Rust Binary (~1.4 MB).\n\
+         \n\
+         Developed by AI (not by humans)\n\
+         https://notbyhumans.fyi",
+        crate::version::VERSION
+    );
+    let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let text_w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            HWND(std::ptr::null_mut()),
+            PCWSTR(text_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
     }
 }

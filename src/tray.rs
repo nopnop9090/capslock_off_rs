@@ -34,6 +34,7 @@ pub enum TrayCommand {
     SetMode(Mode),
     ToggleAutostart,
     TestInject,
+    About,
     Quit,
 }
 
@@ -44,6 +45,7 @@ impl From<MenuEvent> for TrayCommand {
             "quit" => TrayCommand::Quit,
             "test_inject" => TrayCommand::TestInject,
             "autostart" => TrayCommand::ToggleAutostart,
+            "about" => TrayCommand::About,
             "mode_normal" => TrayCommand::SetMode(Mode::Normal),
             "mode_block" => TrayCommand::SetMode(Mode::Block),
             "mode_shift" => TrayCommand::SetMode(Mode::Shift),
@@ -222,6 +224,10 @@ fn build_menu(mode: Mode) -> Menu {
 
     let test = MenuItem::with_id("test_inject", "Test: Caps-Event senden", true, None);
     let _ = menu.append(&test);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
+    let about = MenuItem::with_id("about", "About...", true, None);
+    let _ = menu.append(&about);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let quit = MenuItem::with_id("quit", "Beenden", true, None);
