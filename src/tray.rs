@@ -16,6 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
+};
 
 use crate::app::{self, App};
 use crate::autostart;
@@ -40,6 +44,12 @@ pub fn signal_quit_external() {
 }
 
 /// Bauen und Ausfuehren des Tray. Blockiert bis Quit signalisiert wird.
+///
+/// **Wichtig:** tray-icon 0.19 registriert ein hidden Window mit
+/// `WndProc = tray_proc`, startet aber **keine eigene Message-Loop**.
+/// Ohne aktive `GetMessageW/DispatchMessageW`-Loop im Mainthread kommen
+/// die `WM_USER_TRAYICON`-Klicks vom Explorer-Shell nicht im WindowProc
+/// an und das Menü-Popup geht nicht auf.
 pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
     QUIT_SIGNAL.store(false, Ordering::SeqCst);
     let app_for_cmd = Arc::clone(&app);
@@ -55,15 +65,40 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
         .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))?;
 
     let menu_rx = MenuEvent::receiver();
+    let mut msg = MSG::default();
     loop {
-        if let Ok(event) = menu_rx.try_recv() {
+        // Drain pending menu events (non-blocking).
+        while let Ok(event) = menu_rx.try_recv() {
+            log::info!("Menu-Event empfangen: {:?}", event);
             handle_menu_event(&state, event);
         }
+
+        // Quit-Signal?
         if QUIT_SIGNAL.load(Ordering::SeqCst) {
+            unsafe { PostQuitMessage(0) };
+        }
+
+        // Auf naechste Message warten (blockierend). Dispatches das
+        // tray-icon-Window automatisch via tray_proc.
+        let ret = unsafe {
+            GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0)
+        };
+        if matches!(ret.0, 0 | -1) {
+            // WM_QUIT oder Fehler.
+            log::info!("Message-Loop beendet (ret={})", ret.0);
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // WM_USER_TRAYICON vom Explorer ruft tray_proc auf, der das
+        // Menue via TrackPopupMenu zeigt. Menu-Klicks erzeugen dann
+        // MenuEvents, die oben gedraint werden.
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
     }
+
+    // Tray-Icon drop -> Shell_NotifyIcon NIM_DELETE.
+    state.icon = None;
     Ok(())
 }
 
