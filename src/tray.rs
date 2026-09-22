@@ -79,6 +79,7 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
     let mut state = TrayState {
         cmd: cmd_handler.clone(),
         icon: None,
+        current_mode: mode,
     };
     state
         .build(mode)
@@ -135,6 +136,13 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
                 let _ = writeln!(f, "[iter {iteration}] CMD {cmd:?}");
             }
             cmd_handler(cmd);
+            // Nach ToggleAutostart das Menu neu bauen, damit der Haken
+            // ([x] vs [ ]) sofort den neuen Status reflektiert.
+            if matches!(cmd, TrayCommand::ToggleAutostart) {
+                if let Err(e) = state.rebuild_menu() {
+                    log::warn!("rebuild_menu fehlgeschlagen: {e:?}");
+                }
+            }
         }
 
         // Quit-Signal?
@@ -175,10 +183,12 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
 struct TrayState {
     cmd: CmdHandler,
     icon: Option<TrayIcon>,
+    current_mode: Mode,
 }
 
 impl TrayState {
     fn build(&mut self, mode: Mode) -> tray_icon::Result<()> {
+        self.current_mode = mode;
         let menu = build_menu(mode);
         let icon = TrayIconBuilder::new()
             .with_id("capslock_off")
@@ -187,6 +197,17 @@ impl TrayState {
             .with_menu(Box::new(menu))
             .build()?;
         self.icon = Some(icon);
+        Ok(())
+    }
+
+    /// Baut das Menu neu (liest `autostart::is_enabled()` frisch aus der
+    /// Registry) und setzt es am Tray-Icon. Wird nach `ToggleAutostart`
+    /// aufgerufen, damit der [x]/[ ]-Haken den neuen Status zeigt.
+    fn rebuild_menu(&mut self) -> tray_icon::Result<()> {
+        let menu = build_menu(self.current_mode);
+        if let Some(icon) = self.icon.as_ref() {
+            icon.set_menu(Some(Box::new(menu)));
+        }
         Ok(())
     }
 }
