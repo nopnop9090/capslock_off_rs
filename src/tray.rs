@@ -11,7 +11,10 @@
 //!   - "Test: Caps-Event senden" (id=test_inject)
 //!   - Separator
 //!   - "Beenden" (id=quit)
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -32,6 +35,21 @@ pub enum TrayCommand {
     ToggleAutostart,
     TestInject,
     Quit,
+}
+
+impl From<MenuEvent> for TrayCommand {
+    fn from(event: MenuEvent) -> Self {
+        let id_str = event.id.0.as_str();
+        match id_str {
+            "quit" => TrayCommand::Quit,
+            "test_inject" => TrayCommand::TestInject,
+            "autostart" => TrayCommand::ToggleAutostart,
+            "mode_normal" => TrayCommand::SetMode(Mode::Normal),
+            "mode_block" => TrayCommand::SetMode(Mode::Block),
+            "mode_shift" => TrayCommand::SetMode(Mode::Shift),
+            _ => TrayCommand::Quit, // Fallback: unbekannt -> Quit, damit nichts haengt.
+        }
+    }
 }
 
 pub type CmdHandler = Arc<dyn Fn(TrayCommand) + Send + Sync>;
@@ -57,24 +75,71 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
         app::handle_tray_command(Arc::clone(&app_for_cmd), cmd);
     });
     let mut state = TrayState {
-        cmd: cmd_handler,
+        cmd: cmd_handler.clone(),
         icon: None,
     };
     state
         .build(mode)
         .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))?;
 
-    let menu_rx = MenuEvent::receiver();
+    // File-Logger fuer Diagnose.
+    let log_path = tray_log_path();
+    let mut log_file: Option<File> = match log_path.as_ref() {
+        Some(p) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok(),
+        None => None,
+    };
+    if let Some(f) = log_file.as_mut() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[ts={ts}] tray.run() gestartet, mode={mode:?}");
+    }
+
+    // Menu-Event-Channel: muda dispatchet Menu-Klicks via set_event_handler
+    // (direkter Callback), wir forwarden an einen mpsc::Sender und lesen
+    // in der Main-Message-Loop (non-blocking try_recv zwischen Messages).
+    let (menu_tx, menu_rx) = mpsc::channel::<TrayCommand>();
+    {
+        let log_path_clone = log_path.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            let cmd: TrayCommand = event.into();
+            if let Some(p) = log_path_clone.as_ref() {
+                if let Ok(mut f) = OpenOptions::new().append(true).open(p) {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let _ = writeln!(f, "[ts={ts}] MENU event -> {cmd:?}");
+                }
+            }
+            let _ = menu_tx.send(cmd);
+        }));
+    }
+
     let mut msg = MSG::default();
+    let mut iteration: u64 = 0;
     loop {
+        iteration += 1;
+
         // Drain pending menu events (non-blocking).
-        while let Ok(event) = menu_rx.try_recv() {
-            log::info!("Menu-Event empfangen: {:?}", event);
-            handle_menu_event(&state, event);
+        while let Ok(cmd) = menu_rx.try_recv() {
+            log::info!("TrayCommand: {:?}", cmd);
+            if let Some(f) = log_file.as_mut() {
+                let _ = writeln!(f, "[iter {iteration}] CMD {cmd:?}");
+            }
+            cmd_handler(cmd);
         }
 
         // Quit-Signal?
         if QUIT_SIGNAL.load(Ordering::SeqCst) {
+            if let Some(f) = log_file.as_mut() {
+                let _ = writeln!(f, "[iter {iteration}] QUIT signal");
+            }
             unsafe { PostQuitMessage(0) };
         }
 
@@ -84,10 +149,12 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
             GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0)
         };
         if matches!(ret.0, 0 | -1) {
-            // WM_QUIT oder Fehler.
-            log::info!("Message-Loop beendet (ret={})", ret.0);
+            if let Some(f) = log_file.as_mut() {
+                let _ = writeln!(f, "[iter {iteration}] GetMessageW ret={} -> exit", ret.0);
+            }
             break;
         }
+
         // WM_USER_TRAYICON vom Explorer ruft tray_proc auf, der das
         // Menue via TrackPopupMenu zeigt. Menu-Klicks erzeugen dann
         // MenuEvents, die oben gedraint werden.
@@ -97,7 +164,8 @@ pub fn run(app: Arc<Mutex<App>>, mode: Mode) -> windows::core::Result<()> {
         }
     }
 
-    // Tray-Icon drop -> Shell_NotifyIcon NIM_DELETE.
+    // Cleanup: Handler abmelden + Tray-Icon drop -> Shell_NotifyIcon NIM_DELETE.
+    MenuEvent::set_event_handler::<Box<dyn Fn(MenuEvent) + Send + Sync>>(None);
     state.icon = None;
     Ok(())
 }
@@ -118,29 +186,6 @@ impl TrayState {
             .build()?;
         self.icon = Some(icon);
         Ok(())
-    }
-
-    fn refresh(&mut self, mode: Mode) {
-        if let Some(icon) = self.icon.as_ref() {
-            let _ = icon.set_icon(Some(icons::for_mode(mode)));
-            let _ = icon.set_tooltip(Some(format!("CapsLock: {}", mode.as_str())));
-        }
-    }
-}
-
-fn handle_menu_event(state: &TrayState, event: MenuEvent) {
-    let id_str = event.id.0.as_str();
-    let cmd = match id_str {
-        "quit" => Some(TrayCommand::Quit),
-        "test_inject" => Some(TrayCommand::TestInject),
-        "autostart" => Some(TrayCommand::ToggleAutostart),
-        "mode_normal" => Some(TrayCommand::SetMode(Mode::Normal)),
-        "mode_block" => Some(TrayCommand::SetMode(Mode::Block)),
-        "mode_shift" => Some(TrayCommand::SetMode(Mode::Shift)),
-        _ => None,
-    };
-    if let Some(c) = cmd {
-        (state.cmd)(c);
     }
 }
 
@@ -182,4 +227,10 @@ fn build_menu(mode: Mode) -> Menu {
     let quit = MenuItem::with_id("quit", "Beenden", true, None);
     let _ = menu.append(&quit);
     menu
+}
+
+fn tray_log_path() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let dir = std::path::Path::new(&appdata).join("capslock_off_rs");
+    Some(dir.join("tray.log"))
 }
